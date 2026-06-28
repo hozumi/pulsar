@@ -94,8 +94,10 @@ if [ -z "$PULSAR_LOG_CONF" ]; then
 fi
 
 PULSAR_CLASSPATH="$PULSAR_JAR:$PULSAR_CLASSPATH:$PULSAR_EXTRA_CLASSPATH"
-PULSAR_CLASSPATH="`dirname $PULSAR_LOG_CONF`:$PULSAR_CLASSPATH"
-OPTS="$OPTS -Dlog4j.configurationFile=`basename $PULSAR_LOG_CONF`"
+# Pass $PULSAR_LOG_CONF straight to log4j2 (resolved as a file), not conf-dir-on-classpath + basename:
+# a non-empty dir ahead of the jars on the classpath blocks the AppCDS dump, and keeping the config off
+# the classpath also lets a runtime PULSAR_LOG_CONF override still match the archive.
+OPTS="$OPTS -Dlog4j.configurationFile=$PULSAR_LOG_CONF"
 OPTS="-Djava.net.preferIPv4Stack=true $OPTS"
 # Required to allow sun.misc.Unsafe on JDK 24 without warnings
 # Also required for enabling unsafe memory access for Netty since 4.1.121.Final
@@ -146,6 +148,11 @@ OPTS="-Dio.netty.recycler.maxCapacityPerThread=4096 -Dio.netty.allocator.maxOrde
 OPTS="-cp $PULSAR_CLASSPATH $OPTS"
 
 OPTS="$OPTS $PULSAR_EXTRA_OPTS"
+
+# AppCDS archive baked in at image build time.
+if [ -f "$PULSAR_HOME/cds/pulsar-admin.jsa" ]; then
+  OPTS="$OPTS -XX:SharedArchiveFile=$PULSAR_HOME/cds/pulsar-admin.jsa"
+fi
 
 # log directory & file
 PULSAR_LOG_DIR=${PULSAR_LOG_DIR:-"$PULSAR_HOME/logs"}
