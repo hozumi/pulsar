@@ -42,7 +42,7 @@ COPY scripts/* /pulsar/bin/
 # container when gid=0 is prohibited. In that case, the container must be run with uid 10000 with
 # any group id != 0 (for example 10001).
 # The file permissions are preserved when copying files from this builder image to the target image.
-RUN for SUBDIRECTORY in conf data download logs instances/deps packages-storage; do \
+RUN for SUBDIRECTORY in conf data download logs instances/deps packages-storage cds; do \
      mkdir -p /pulsar/$SUBDIRECTORY; \
      chmod -R ug+rwx /pulsar/$SUBDIRECTORY; \
      chown -R 10000:0 /pulsar/$SUBDIRECTORY; \
@@ -211,3 +211,18 @@ ENV LD_PRELOAD=/lib/libgcompat.so.0
 ARG DEFAULT_USERNAME=pulsar
 RUN adduser ${DEFAULT_USERNAME} -u 10000 -G root -D -H -h /pulsar/data
 USER 10000
+
+# AppCDS for the pulsar-admin CLI: a single self-contained archive under /pulsar/cds (NOT the default
+# /opt/jvm location), so only pulsar-admin loads it and broker/bookie/etc. are unaffected.
+# Built via a class-list training run (the unreachable --admin-url loads the REST client stack, not just
+# CLI parsing, with no broker needed) + a static -Xshare:dump, both through pulsar-admin-common.sh so the
+# dump's --add-opens match the CLI's at runtime -- a mismatch makes JDK 25+ log a non-fatal
+# "[error][cds] ... Disabling optimized module handling". Throwaway PULSAR_LOG_DIR avoids a log under /pulsar/logs.
+RUN mkdir -p /tmp/cds-train; \
+    PULSAR_LOG_DIR=/tmp/cds-train OPTS="-XX:DumpLoadedClassList=/tmp/cds-train/pulsar-admin.classlist" \
+      /pulsar/bin/pulsar-admin --admin-url http://localhost:1 clusters list > /dev/null 2>&1 || true; \
+    PULSAR_LOG_DIR=/tmp/cds-train \
+    OPTS="-Xshare:dump -XX:SharedClassListFile=/tmp/cds-train/pulsar-admin.classlist -XX:SharedArchiveFile=/pulsar/cds/pulsar-admin.jsa" \
+      /pulsar/bin/pulsar-admin --admin-url http://localhost:1 clusters list > /dev/null 2>&1 || true; \
+    rm -rf /tmp/cds-train; \
+    test -f /pulsar/cds/pulsar-admin.jsa
