@@ -81,7 +81,12 @@ add_gradle_deps_to_classpath() {
 }
 
 if [ -d "$PULSAR_HOME/lib" ]; then
-    PULSAR_CLASSPATH="$PULSAR_CLASSPATH:$PULSAR_HOME/lib/*"
+    # Build the lib classpath as an explicit, C-locale-sorted list rather than the `lib/*` wildcard: the
+    # JVM expands `lib/*` in filesystem readdir order, which varies across hosts/filesystems, so a prebuilt
+    # CDS archive (which records the expanded classpath and matches it positionally) would silently mismatch
+    # and no-op on a host whose order differs. A fixed order keeps the archive portable, and also makes
+    # duplicate-class precedence deterministic instead of filesystem-dependent.
+    PULSAR_CLASSPATH="$PULSAR_CLASSPATH:$(LC_ALL=C; set -- "$PULSAR_HOME"/lib/*.jar; IFS=:; printf '%s' "$*")"
 else
     add_gradle_deps_to_classpath
 fi
@@ -94,8 +99,10 @@ if [ -z "$PULSAR_LOG_CONF" ]; then
 fi
 
 PULSAR_CLASSPATH="$PULSAR_JAR:$PULSAR_CLASSPATH:$PULSAR_EXTRA_CLASSPATH"
-PULSAR_CLASSPATH="`dirname $PULSAR_LOG_CONF`:$PULSAR_CLASSPATH"
-OPTS="$OPTS -Dlog4j.configurationFile=`basename $PULSAR_LOG_CONF`"
+# Pass $PULSAR_LOG_CONF straight to log4j2 (resolved as a file), not conf-dir-on-classpath + basename:
+# a non-empty dir ahead of the jars on the classpath blocks the AppCDS dump, and keeping the config off
+# the classpath also lets a runtime PULSAR_LOG_CONF override still match the archive.
+OPTS="$OPTS -Dlog4j.configurationFile=$PULSAR_LOG_CONF"
 OPTS="-Djava.net.preferIPv4Stack=true $OPTS"
 # Bridge java.util.logging (JUL) to Log4j2 so that JUL logs from third-party libraries
 # (Jersey, gRPC, Guava, etc.) are bridged into the Log4j2 configuration (conf/log4j2.yaml)
@@ -166,6 +173,36 @@ OPTS="-Dio.netty.recycler.maxCapacityPerThread=4096 -Dio.netty.allocator.maxOrde
 OPTS="-Dio.netty.leakDetection.level=disabled $OPTS"
 
 OPTS="-cp $PULSAR_CLASSPATH $OPTS"
+
+# AppCDS to cut CLI JVM startup (pulsar-admin/-client/-shell all source this). Only in an installed layout
+# (a lib/ dir); a dev/source tree is skipped, so no cds/ is created there. Two archive files:
+#  - pulsar-admin-static.jsa: a self-contained static archive (JDK base + app classes), e.g. pre-baked by
+#    the Docker image; loaded directly when present, no base archive needed.
+#  - pulsar-admin-dynamic.jsa: for an install whose JDK ships a base CDS archive (e.g. a full-JDK tarball).
+#    Loaded if present; -XX:+AutoCreateSharedArchive (creates it on first run, self-heals after a JDK or
+#    classpath change) is added only where the cds dir is writable -- against a read-only dir it aborts the
+#    JVM (exit 1), hence the [ -w ] gate (set PULSAR_CDS_DIR to a writable path to enable it for a read-only
+#    install). With no archive and no write access CDS is skipped. Separate static/dynamic names keep the
+#    auto-created file from tripping the static branch. A JDK with no base archive is a benign no-op (exit 0).
+# Runtime CDS messages are non-actionable (the environment just doesn't match the archive, so CDS no-ops and
+# only the speedup is lost) and default to stdout, where they would corrupt `pulsar-admin ... | jq`, so
+# silence them with -Xlog:cds=off; PULSAR_EXTRA_OPTS is appended after this and can re-enable it (-Xlog:cds).
+# Opt out with PULSAR_CDS_ENABLED=false.
+if [ "${PULSAR_CDS_ENABLED:-true}" = "true" ] && [ -d "$PULSAR_HOME/lib" ]; then
+    PULSAR_CDS_DIR=${PULSAR_CDS_DIR:-"$PULSAR_HOME/cds"}
+    if [ -f "$PULSAR_CDS_DIR/pulsar-admin-static.jsa" ]; then
+        OPTS="$OPTS -XX:SharedArchiveFile=$PULSAR_CDS_DIR/pulsar-admin-static.jsa -Xlog:cds=off"
+    elif [[ $JAVA_MAJOR_VERSION -ge 19 ]]; then
+        mkdir -p "$PULSAR_CDS_DIR" 2>/dev/null || true
+        PULSAR_CDS_DYNAMIC="$PULSAR_CDS_DIR/pulsar-admin-dynamic.jsa"
+        if [ -f "$PULSAR_CDS_DYNAMIC" ]; then
+            OPTS="$OPTS -XX:SharedArchiveFile=$PULSAR_CDS_DYNAMIC -Xlog:cds=off"
+            [ -w "$PULSAR_CDS_DIR" ] && OPTS="$OPTS -XX:+AutoCreateSharedArchive"
+        elif [ -w "$PULSAR_CDS_DIR" ]; then
+            OPTS="$OPTS -XX:+AutoCreateSharedArchive -XX:SharedArchiveFile=$PULSAR_CDS_DYNAMIC -Xlog:cds=off"
+        fi
+    fi
+fi
 
 OPTS="$OPTS $PULSAR_EXTRA_OPTS"
 

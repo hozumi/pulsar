@@ -42,7 +42,7 @@ COPY scripts/* /pulsar/bin/
 # container when gid=0 is prohibited. In that case, the container must be run with uid 10000 with
 # any group id != 0 (for example 10001).
 # The file permissions are preserved when copying files from this builder image to the target image.
-RUN for SUBDIRECTORY in conf data download logs instances/deps packages-storage; do \
+RUN for SUBDIRECTORY in conf data download logs instances/deps packages-storage cds; do \
      mkdir -p /pulsar/$SUBDIRECTORY; \
      chmod -R ug+rwx /pulsar/$SUBDIRECTORY; \
      chown -R 10000:0 /pulsar/$SUBDIRECTORY; \
@@ -237,3 +237,26 @@ ENV LD_PRELOAD=/usr/lib/libmimalloc.so.3:/lib/libgcompat.so.0
 ARG DEFAULT_USERNAME=pulsar
 RUN adduser ${DEFAULT_USERNAME} -u 10000 -G root -D -H -h /pulsar/data
 USER 10000
+
+# AppCDS for the admin/client/shell CLIs: a single self-contained static archive under /pulsar/cds (NOT
+# the default /opt/jvm location), so only the CLI launcher loads it and broker/bookie/etc. are unaffected.
+# Built via a class-list training run (the unreachable --admin-url loads the REST client stack, not just
+# CLI parsing, no broker needed) then a static -Xshare:dump, both through pulsar-admin-common.sh so the
+# dump's --add-opens match the CLI's at runtime (a mismatch makes JDK 25+ log a non-fatal
+# "[error][cds] ... Disabling optimized module handling"). PULSAR_CDS_ENABLED=false stops the launcher's
+# own CDS loader from interfering while the archive is being built; throwaway PULSAR_LOG_DIR avoids a log
+# under /pulsar/logs. /pulsar/cds is created group-writable (uid 10000) by the builder-stage loop above.
+# The training run is expected to fail (connection refused), so its output is dropped; the -Xshare:dump
+# output is kept in the build log -- it always emits benign "class cannot be archived" warnings (dynamic
+# proxies, JFR events, re-linked classes), which also make a real dump problem visible. Correctness is
+# gated on a non-empty class list and a non-empty archive, so a real failure still stops the build.
+RUN set -e; \
+    mkdir -p /tmp/cds-train; \
+    PULSAR_CDS_ENABLED=false PULSAR_LOG_DIR=/tmp/cds-train OPTS="-XX:DumpLoadedClassList=/tmp/cds-train/pulsar-admin.classlist" \
+      /pulsar/bin/pulsar-admin --admin-url http://localhost:1 clusters list > /dev/null 2>&1 || true; \
+    test -s /tmp/cds-train/pulsar-admin.classlist; \
+    PULSAR_CDS_ENABLED=false PULSAR_LOG_DIR=/tmp/cds-train \
+    OPTS="-Xshare:dump -XX:SharedClassListFile=/tmp/cds-train/pulsar-admin.classlist -XX:SharedArchiveFile=/pulsar/cds/pulsar-admin-static.jsa" \
+      /pulsar/bin/pulsar-admin --admin-url http://localhost:1 clusters list; \
+    rm -rf /tmp/cds-train; \
+    test -s /pulsar/cds/pulsar-admin-static.jsa
